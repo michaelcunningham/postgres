@@ -1,0 +1,603 @@
+--
+-- Greenplum Database database dump
+--
+
+SET statement_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = off;
+SET check_function_bodies = false;
+SET client_min_messages = warning;
+SET escape_string_warning = off;
+
+SET default_with_oids = false;
+
+--
+-- Name: dba_work; Type: SCHEMA; Schema: -; Owner: gpadmin
+--
+
+CREATE SCHEMA dba_work;
+
+
+ALTER SCHEMA dba_work OWNER TO gpadmin;
+
+SET search_path = dba_work, pg_catalog;
+
+--
+-- Name: dedup_table(character varying); Type: FUNCTION; Schema: dba_work; Owner: gpadmin
+--
+
+CREATE FUNCTION dedup_table(p_table character varying) RETURNS character varying
+    AS $$ 
+DECLARE
+
+v_table VARCHAR;
+v_schema VARCHAR;
+v_counter INTEGER;
+v_target_table VARCHAR;
+v_temp_table VARCHAR;
+v_col_list TEXT;
+v_record RECORD;
+v_sql TEXT;
+
+BEGIN
+
+----------------
+-- VALIDATION --
+----------------
+
+-- Check: p_table
+v_schema := upper( split_part( p_table, '.', 1));
+v_table := upper( split_part( p_table, '.', 2));
+IF ( length( p_table) <> length( v_schema) + 1 + length( v_table) ) THEN
+RAISE EXCEPTION 'Invalid P_TABLE value: %. It should match the pattern: "SCHEMA.TABLE". Execution stopped.', upper( p_table);
+END IF;
+PERFORM 1 FROM pg_tables WHERE upper(schemaname) = v_schema AND upper(tablename) = v_table;
+IF not found THEN 
+RAISE EXCEPTION 'Table % does not exists. Execution stopped.', upper( p_table);
+END IF;
+v_target_table := v_schema || '.' || v_table;
+
+-- Check: p_where 
+IF ( length( trim( p_where)) > 0 ) THEN
+EXECUTE 'SELECT count(*) FROM (SELECT * FROM ' || v_target_table || ' WHERE ' || p_where || ' LIMIT 1) x' INTO v_counter;
+IF v_counter = 0 THEN 
+RETURN 'There is no data in table ' || v_target_table || ' for ' || p_where || '.';
+END IF;
+END IF;
+
+----------
+-- MAIN --
+----------
+
+-- Build the list of columns
+v_col_list := '';
+FOR v_record IN (
+SELECT column_name FROM information_schema.columns WHERE table_schema = lower(v_schema) AND table_name = lower(v_table) ORDER BY ordinal_position
+) LOOP
+IF v_col_list = '' THEN
+v_col_list := v_record.column_name;
+ELSE
+v_col_list := v_col_list || ', ' || v_record.column_name;
+END IF;
+END LOOP;
+
+-- Check if there are any dups
+v_sql := 'SELECT count(*) FROM (SELECT ' || v_col_list || ' FROM ' || v_target_table || ' GROUP BY ' || v_col_list || ' HAVING count(*) > 1) x';
+EXECUTE v_sql INTO v_counter;
+IF v_counter = 0 THEN
+RETURN 'There are no duplicate rows in table ' || v_target_table || ' for ' || p_where || '.';
+END IF;
+
+-- Create the temp table without the duplicates 
+v_temp_table := v_table || '_deduped';
+v_sql := 'CREATE TABLE ' || v_temp_table || ' WITH (APPENDONLY=true) AS SELECT ' || v_col_list || ' FROM ' || v_target_table || ' GROUP BY ' || v_col_list;
+EXECUTE v_sql;
+
+-- Cleanup target table
+EXECUTE 'truncate table ' || v_target_table ;
+
+-- Move deduplicated data from temp to source table
+EXECUTE 'INSERT INTO ' || v_target_table || ' SELECT * FROM ' || v_temp_table;
+
+-- Move deduplicated data from temp to source table
+--EXECUTE 'DROP TABLE ' || v_temp_table;
+
+-- Final recap
+RETURN 'Duplicates removed.';
+
+END;
+$$
+    LANGUAGE plpgsql;
+
+
+ALTER FUNCTION dba_work.dedup_table(p_table character varying) OWNER TO gpadmin;
+
+--
+-- Name: list_distribution_keys(text); Type: FUNCTION; Schema: dba_work; Owner: gpadmin
+--
+
+CREATE FUNCTION list_distribution_keys(schemaname text) RETURNS SETOF text
+    AS $$
+/*
+   Greenplum Professional Services
+   GR, 10/09
+   For a given schema, loop through catalog tables and generate the GPDB distribution keys.
+   If the schemaname parameter is 'all', iterate over all user schemas plus the PG 'public' schema
+*/
+DECLARE
+-- function loop variables
+   schema_recset record;
+   table_recset record;
+   dk_recset record;
+   column_recset record;
+   output_line text := NULL;
+   msg_string text := NULL;
+   schema_select_str text := NULL;
+   table_select_str text := NULL;
+   dk_select_str text := NULL;
+   column_select_str text := NULL;
+   dk_list text := NULL;
+   dk_element text := NULL;
+   dk_col_name name := NULL;
+   schema_oid oid := 0;
+   dk_list_len smallint := 0;
+   i integer := 0;
+   j integer := 0;
+BEGIN
+IF schemaname = 'all' THEN -- apply to all schemas, need three nested loops (schema, table, list of dist columns) to get the column names
+   schema_select_str := 'SELECT nspname, oid FROM ONLY pg_catalog.pg_namespace WHERE nspname !~~ ''pg_%'' AND nspname !~~ ''gp_%'' AND nspname <> ''information_schema'' ORDER BY nspname;';
+   FOR schema_recset IN execute schema_select_str LOOP
+      table_select_str :=  'SELECT relname, oid FROM ONLY pg_catalog.pg_class WHERE relnamespace = ' || schema_recset.oid || ' AND relname !~~ ''%_prt_%'' AND relstorage <> ''v'' AND relstorage <> ''x'' order by relname;';
+   FOR table_recset IN execute table_select_str LOOP
+   dk_select_str :=  'SELECT array_to_string(attrnums, chr(44)) as dist_keys, array_dims(attrnums) as key_dim FROM ONLY pg_catalog.gp_distribution_policy WHERE localoid = ' || table_recset.oid || ';';
+   FOR dk_recset IN execute dk_select_str LOOP
+IF length(dk_recset.dist_keys) = 0 THEN -- zero = randomly
+         output_line := schema_recset.nspname || '.' || table_recset.relname || ' DISTRIBUTED RANDOMLY';
+   RETURN NEXT output_line;
+ELSE -- there are some dist keys
+         output_line := schema_recset.nspname || '.' || table_recset.relname || ' DISTRIBUTED BY (';
+dk_list := dk_recset.dist_keys;
+dk_list_len := trim(trailing ']' from split_part(dk_recset.key_dim, ':', 2))::smallint;
+i := 1;
+WHILE i <= dk_list_len LOOP
+dk_element := split_part(dk_list, ',', i);
+   column_select_str := 'SELECT attname from pg_catalog.pg_attribute WHERE attrelid = ' || table_recset.oid::oid || ' AND attnum = ' || dk_element::smallint || ';';
+   EXECUTE column_select_str INTO dk_col_name; -- is a 'name' datatype, to match catalog table
+   output_line := output_line || dk_col_name || ', '; -- add column name to the list
+i := i + 1; -- next element?
+END LOOP; -- while there are some more list elments
+         output_line := trim(trailing ', ' FROM output_line) || ')'; -- delete last comma, insert closing paren
+   RETURN NEXT output_line;
+   END IF; -- there are zero or > 0 dist keys
+      END LOOP; -- processing column arrays
+  END LOOP; -- tables within the named schema
+END LOOP; -- schemas
+ELSE -- apply to single schema, two nested loops
+   schema_select_str := 'SELECT oid FROM ONLY pg_catalog.pg_namespace where nspname = ''' || schemaname || ''';';
+   EXECUTE schema_select_str INTO schema_oid;
+      table_select_str :=  'SELECT relname, oid FROM ONLY pg_catalog.pg_class WHERE relnamespace = ' || schema_oid || ' AND relname !~~ ''%_prt_%''  AND relstorage <> ''v'' AND relstorage <> ''x'' order by relname;';
+   FOR table_recset IN execute table_select_str LOOP
+   dk_select_str :=  'SELECT array_to_string(attrnums, chr(44)) as dist_keys, array_dims(attrnums) as key_dim FROM ONLY pg_catalog.gp_distribution_policy WHERE localoid = ' || table_recset.oid || ';';
+   FOR dk_recset IN execute dk_select_str LOOP
+IF length(dk_recset.dist_keys) = 0 THEN -- zero = randomly
+         output_line := schemaname || '.' || table_recset.relname || ' DISTRIBUTED RANDOMLY';
+   RETURN NEXT output_line;
+ELSE -- there are some dist keys
+         output_line := schemaname || '.' || table_recset.relname || ' DISTRIBUTED BY (';
+dk_list := dk_recset.dist_keys;
+dk_list_len := trim(trailing ']' from split_part(dk_recset.key_dim, ':', 2))::smallint;
+i := 1;
+WHILE i <= dk_list_len LOOP
+dk_element := split_part(dk_list, ',', i);
+   column_select_str := 'SELECT attname from pg_catalog.pg_attribute WHERE attrelid = ' || table_recset.oid::oid || ' AND attnum = ' || dk_element::smallint || ';';
+   EXECUTE column_select_str INTO dk_col_name; -- is a 'name' datatype, to match catalog table
+   output_line := output_line || dk_col_name || ', '; -- add column name to the list
+i := i + 1; -- next element?
+END LOOP; -- while there are some more list elments
+         output_line := trim(trailing ', ' FROM output_line) || ')'; -- delete last comma, insert closing paren
+   RETURN NEXT output_line;
+   END IF; -- there are zero or > 0 dist keys
+      END LOOP; -- processing column arrays
+  END LOOP; -- tables within the named schema
+END IF; -- single or all schemas
+RETURN;
+END;
+$$
+    LANGUAGE plpgsql;
+
+
+ALTER FUNCTION dba_work.list_distribution_keys(schemaname text) OWNER TO gpadmin;
+
+--
+-- Name: schema_grant(text, text, text, text); Type: FUNCTION; Schema: dba_work; Owner: gpadmin
+--
+
+CREATE FUNCTION schema_grant(text, text, text, text) RETURNS integer
+    AS $_$
+-- Usage: select schema_grant('role','permission','object','schema');
+-- Usage: select schema_grant('role','all','%','schema');
+DECLARE obj record;
+num integer;
+BEGIN
+num:=0;
+FOR obj IN SELECT relname FROM pg_class c
+JOIN pg_namespace ns ON (c.relnamespace = ns.oid) WHERE
+relkind in ('r','v','S') AND
+nspname = $4 AND
+relname LIKE $3
+LOOP
+EXECUTE 'GRANT ' ||$2|| ' ON ' ||$4|| '.' || obj.relname || ' TO ' ||$1;
+num := num + 1;
+END LOOP;
+RETURN num;
+END;
+$_$
+    LANGUAGE plpgsql SECURITY DEFINER;
+
+
+ALTER FUNCTION dba_work.schema_grant(text, text, text, text) OWNER TO gpadmin;
+
+--
+-- Name: schema_revoke(text, text, text, text); Type: FUNCTION; Schema: dba_work; Owner: gpadmin
+--
+
+CREATE FUNCTION schema_revoke(text, text, text, text) RETURNS integer
+    AS $_$
+-- Usage: select schema_revoke('role','permission','object','schema');
+-- Usage: select schema_revoke('role','all','%','schema');
+DECLARE obj record;
+num integer;
+BEGIN
+num:=0;
+FOR obj IN SELECT relname FROM pg_class c
+JOIN pg_namespace ns ON (c.relnamespace = ns.oid) WHERE
+relkind in ('r','v','S') AND
+nspname = $4 AND
+relname LIKE $3
+LOOP
+EXECUTE 'REVOKE ' ||$2|| ' ON ' ||$4|| '.' || obj.relname || ' FROM ' ||$1;
+num := num + 1;
+END LOOP;
+RETURN num;
+END;
+$_$
+    LANGUAGE plpgsql SECURITY DEFINER;
+
+
+ALTER FUNCTION dba_work.schema_revoke(text, text, text, text) OWNER TO gpadmin;
+
+--
+-- Name: set_stats_ddl(text, text, integer); Type: FUNCTION; Schema: dba_work; Owner: gpadmin
+--
+
+CREATE FUNCTION set_stats_ddl(scope text, table_or_schema text, new_buckets integer) RETURNS SETOF text
+    AS $$
+/*
+GR, Greenplum Professional Services
+Generates DDL to set the number of statistics histogram buckets to a specified number, usually zero. Then increase high-value columns and execute the script. In order of importance, high-value columns are those used in JOINs, WHERE clauses, and GROUP BY / ORDER BY clauses. Future ANALYZEs will skip SELECT columns and focus on more important ones, making them more efficient and increasing query plan quality.
+
+Note that a zero value will not delete existing stats, so it's recommended to do at least one ANALYZE with the default value of 25 (or perhaps the number
+of segments) and a reasonable amount of data. The default_statistics_target
+switch is set on the master and takes effect with a postgresql.conf reload,
+done with gpstop -u.
+
+Usage:
+1. scope = 's', table_or_schema = 'all'
+all user schemas, all tables, all columns
+2. scope = 's', table_or_schema = '<single_schema>'
+all tables and their columns in the specified schema
+3. scope = 't', table_or_schema = '<single_table>'
+all columns for the specified table
+note that there could be more than one schema
+*/
+DECLARE
+-- function loop variables
+   schema_recset record;
+   table_recset record;
+   column_recset record;
+   output_line text := NULL;
+   schema_select_str text := NULL;
+   table_select_str text := NULL;
+   column_select_str text := NULL;
+BEGIN
+IF scope = 's' and table_or_schema = 'all' THEN -- apply to all schemas, need three nested loops
+   schema_select_str := 'SELECT table_schema FROM ONLY information_schema.tables where table_schema not like ''pg_%'' and table_schema <> ''information_schema'' and table_schema <> ''gp_toolkit'';';
+   FOR schema_recset IN execute schema_select_str LOOP
+      table_select_str :=  'SELECT table_name FROM ONLY information_schema.tables WHERE table_schema = ''' || schema_recset.table_schema || ''' and table_name not like ''%_prt_%'';';
+   FOR table_recset IN execute table_select_str LOOP
+column_select_str :=  'SELECT DISTINCT column_name, ordinal_position, data_type, character_maximum_length, numeric_precision, numeric_scale FROM ONLY information_schema.columns WHERE table_schema = ''' || schema_recset.table_schema || ''' AND table_name = ''' || table_recset.table_name || ''' ORDER BY ordinal_position;';
+   FOR column_recset IN execute column_select_str LOOP
+output_line := 'ALTER TABLE ' || schema_recset.table_schema || '.' || table_recset.table_name || ' ALTER COLUMN ' || column_recset.column_name || ' SET STATISTICS ' || new_buckets ||';';
+RETURN NEXT output_line;
+   END LOOP; -- columns
+END LOOP; -- tables
+END LOOP; -- schemas
+ELSIF scope = 's' THEN -- apply to single schema, two nested loops
+      table_select_str :=  'SELECT table_name FROM ONLY information_schema.tables WHERE table_schema = ''' || table_or_schema || ''' and table_name not like ''%_prt_%'';';
+   FOR table_recset IN execute table_select_str LOOP
+column_select_str :=  'SELECT DISTINCT column_name, ordinal_position, data_type, character_maximum_length, numeric_precision, numeric_scale FROM ONLY information_schema.columns WHERE table_schema = ''' || table_or_schema || ''' AND table_name = ''' || table_recset.table_name || ''' ORDER BY ordinal_position;';
+   FOR column_recset IN execute column_select_str LOOP
+output_line := 'ALTER TABLE ' || table_or_schema || '.' || table_recset.table_name || ' ALTER COLUMN ' || column_recset.column_name || ' SET STATISTICS ' || new_buckets ||';';
+RETURN NEXT output_line;
+   END LOOP; -- columns
+END LOOP; -- tables within the named schema
+ELSIF scope = 't' THEN -- single table, need the schema(s), could be > 1
+      schema_select_str :=  'SELECT table_schema FROM ONLY information_schema.tables WHERE table_name = ''' || table_or_schema || ''';';
+   FOR schema_recset IN execute schema_select_str LOOP
+column_select_str :=  'SELECT DISTINCT column_name, ordinal_position, data_type, character_maximum_length, numeric_precision, numeric_scale FROM ONLY information_schema.columns WHERE table_schema = ''' || schema_recset.table_schema || ''' AND table_name = ''' || table_or_schema || ''' ORDER BY ordinal_position;';
+   FOR column_recset IN execute column_select_str LOOP
+output_line := 'ALTER TABLE ' || schema_recset.table_schema || '.' || table_or_schema || ' ALTER COLUMN ' || column_recset.column_name || ' SET STATISTICS ' || new_buckets ||';';
+RETURN NEXT output_line;
+   END LOOP; -- columns
+END LOOP; -- columns within the named table
+ELSE -- this shouldn't happen; if so, display usage
+output_line := 'Sorry - there appears to be a problematic parameter...';
+RETURN NEXT output_line;
+output_line := 'Parameters: (''t'' | ''s'', schema | table | ''all'', number_of_buckets)';
+RETURN NEXT output_line;
+END IF; -- all schemas, single schema, or table cases
+RETURN;
+END;
+$$
+    LANGUAGE plpgsql;
+
+
+ALTER FUNCTION dba_work.set_stats_ddl(scope text, table_or_schema text, new_buckets integer) OWNER TO gpadmin;
+
+SET default_tablespace = '';
+
+--
+-- Name: config; Type: TABLE; Schema: dba_work; Owner: gpadmin; Tablespace: 
+--
+
+CREATE TABLE config (
+    content smallint,
+    definedprimary boolean,
+    dbid smallint,
+    isprimary boolean,
+    valid boolean,
+    hostname name,
+    port integer,
+    datadir text
+) DISTRIBUTED RANDOMLY;
+
+
+ALTER TABLE dba_work.config OWNER TO gpadmin;
+
+--
+-- Name: df_ext; Type: EXTERNAL TABLE; Schema: dba_work; Owner: gpadmin; Tablespace: 
+--
+
+CREATE EXTERNAL WEB TABLE df_ext (
+    hostname text,
+    size text,
+    used text,
+    avail text
+) EXECUTE E'
+dlist=`zpool list|grep -v NAME|tr -s " " | cut -f2-4 -d" " | tr " " "|"`;
+ hname=`uname -n`;
+echo "${hname}|$dlist";
+' ON ALL 
+ FORMAT 'text' (delimiter E'|' null E'' escape E'OFF')
+ENCODING 'UTF8';
+
+
+ALTER EXTERNAL TABLE dba_work.df_ext OWNER TO gpadmin;
+
+--
+-- Name: file_size; Type: TABLE; Schema: dba_work; Owner: gpadmin; Tablespace: 
+--
+
+CREATE TABLE file_size (
+    schemaname text,
+    tablename text,
+    partitionname text,
+    size_int double precision,
+    size_text text,
+    date_insert date
+) DISTRIBUTED RANDOMLY;
+
+
+ALTER TABLE dba_work.file_size OWNER TO gpadmin;
+
+--
+-- Name: gp_part_bounds; Type: VIEW; Schema: dba_work; Owner: gpadmin
+--
+
+CREATE VIEW gp_part_bounds AS
+    SELECT pg_partitions.partitionschemaname AS schema, pg_partitions.partitiontablename AS "table", pg_partitions.partitiontype AS ptype, pg_partitions.partitionlistvalues AS list_vals, pg_partitions.partitionboundary AS boundary_expr FROM pg_partitions ORDER BY pg_partitions.partitionschemaname, pg_partitions.partitiontablename;
+
+
+ALTER TABLE dba_work.gp_part_bounds OWNER TO gpadmin;
+
+--
+-- Name: gp_proc; Type: VIEW; Schema: dba_work; Owner: gpadmin
+--
+
+CREATE VIEW gp_proc AS
+    SELECT COALESCE(pg_resqueue.rsqname, '[none]'::name) AS q_name, pg_stat_activity.usename AS u_name, pg_stat_activity.waiting AS wait, pg_stat_activity.procpid AS pid, pg_stat_activity.sess_id AS s_id, pg_stat_activity.client_addr AS ip_addr, (now() - pg_stat_activity.query_start) AS run_time, (pg_stat_activity.current_query)::character varying(52) AS sql_stmt_begins FROM ((pg_stat_activity JOIN pg_roles ON ((pg_stat_activity.usename = pg_roles.rolname))) LEFT JOIN pg_resqueue ON ((pg_roles.rolresqueue = pg_resqueue.oid))) ORDER BY (now() - pg_stat_activity.query_start) DESC;
+
+
+ALTER TABLE dba_work.gp_proc OWNER TO gpadmin;
+
+--
+-- Name: gp_schema_size; Type: VIEW; Schema: dba_work; Owner: gpadmin
+--
+
+CREATE VIEW gp_schema_size AS
+    SELECT pg_tables.schemaname, to_char(((((sum(pg_relation_size((((pg_tables.schemaname)::text || '.'::text) || (pg_tables.tablename)::text))) / (1024)::numeric) / (1024)::numeric) / (1024)::numeric))::numeric(18,3), 'FM999,999,999.9999'::text) AS "Table_Size_GB", to_char(((((sum(pg_total_relation_size((((pg_tables.schemaname)::text || '.'::text) || (pg_tables.tablename)::text))) / (1024)::numeric) / (1024)::numeric) / (1024)::numeric))::numeric(18,3), 'FM999,999,999.9999'::text) AS "Total_size_GB" FROM pg_tables WHERE ((((pg_tables.schemaname !~~ 'pg_%'::text) AND (pg_tables.schemaname <> 'information_schema'::name)) AND (pg_tables.schemaname <> 'gp_toolkit'::name)) AND (pg_tables.schemaname <> 'public'::name)) GROUP BY pg_tables.schemaname ORDER BY pg_tables.schemaname;
+
+
+ALTER TABLE dba_work.gp_schema_size OWNER TO gpadmin;
+
+--
+-- Name: gp_table_size; Type: VIEW; Schema: dba_work; Owner: gpadmin
+--
+
+CREATE VIEW gp_table_size AS
+    SELECT pg_tables.schemaname, pg_tables.tablename, to_char(((((pg_relation_size((((pg_tables.schemaname)::text || '.'::text) || (pg_tables.tablename)::text)))::numeric / (1024)::numeric) / (1024)::numeric) / ((1024)::numeric)::numeric(12,3)), 'FM999,999,999.9999'::text) AS "Table_Size_GB", to_char(((((pg_total_relation_size((((pg_tables.schemaname)::text || '.'::text) || (pg_tables.tablename)::text)))::numeric / (1024)::numeric) / (1024)::numeric) / ((1024)::numeric)::numeric(12,3)), 'FM999,999,999.9999'::text) AS "Total_size_GB" FROM pg_tables WHERE ((((pg_tables.schemaname !~~ 'pg_%'::text) AND (pg_tables.schemaname <> 'information_schema'::name)) AND (pg_tables.schemaname <> 'gp_toolkit'::name)) AND (pg_tables.schemaname <> 'public'::name)) ORDER BY pg_tables.schemaname, pg_tables.tablename;
+
+
+ALTER TABLE dba_work.gp_table_size OWNER TO gpadmin;
+
+--
+-- Name: load_ext; Type: EXTERNAL TABLE; Schema: dba_work; Owner: gpadmin; Tablespace: 
+--
+
+CREATE EXTERNAL WEB TABLE load_ext (
+    hostname text,
+    min1 numeric,
+    mins5 numeric,
+    mins15 numeric
+) EXECUTE E'
+load_avg=`uptime |tr -d \'min(s):,loadaverage\'|tr -s \' \' \'|\'|tr -s \'|\' \' \'| awk \'{print $8"|"$9"|"$10}\' | tr -d ","`;hname=`uname -n`; echo "${hname}|${load_avg}";
+' ON ALL 
+ FORMAT 'text' (delimiter E'|' null E'' escape E'OFF')
+ENCODING 'UTF8';
+
+
+ALTER EXTERNAL TABLE dba_work.load_ext OWNER TO gpadmin;
+
+--
+-- Name: load_view; Type: VIEW; Schema: dba_work; Owner: gpadmin
+--
+
+CREATE VIEW load_view AS
+    SELECT DISTINCT load_ext.hostname, load_ext.min1 AS last_1, load_ext.mins5 AS last_5, load_ext.mins15 AS last_15 FROM ONLY load_ext ORDER BY load_ext.hostname, load_ext.min1, load_ext.mins5, load_ext.mins15;
+
+
+ALTER TABLE dba_work.load_view OWNER TO gpadmin;
+
+--
+-- Name: lox; Type: VIEW; Schema: dba_work; Owner: gpadmin
+--
+
+CREATE VIEW lox AS
+    SELECT (((n.nspname)::text || '.'::text) || (c.relname)::text) AS object_locked, s.usename AS role_name, l.pid, l.locktype AS lock_type, l.mode AS lock_mode, l.granted, s.waiting, (now() - s.query_start) AS run_time, (s.current_query)::character varying(255) AS stmt_begins FROM pg_locks l, pg_class c, pg_database d, pg_stat_activity s, pg_namespace n WHERE (((((l.relation = c.oid) AND (l.database = d.oid)) AND (l.pid = s.procpid)) AND (c.relnamespace = n.oid)) AND (n.nspname !~ '^pg_'::text)) ORDER BY l.relation, d.datname, n.nspname, c.relname, l.pid;
+
+
+ALTER TABLE dba_work.lox OWNER TO gpadmin;
+
+--
+-- Name: message_log; Type: TABLE; Schema: dba_work; Owner: gpadmin; Tablespace: 
+--
+
+CREATE TABLE message_log (
+    dt timestamp(6) without time zone,
+    sub_type character varying(10),
+    to_user_id numeric(15,0),
+    from_user_id numeric(15,0),
+    msg_id numeric(30,0),
+    time_sent timestamp(6) without time zone,
+    session_id character varying(32)
+) DISTRIBUTED BY (from_user_id);
+
+
+ALTER TABLE dba_work.message_log OWNER TO gpadmin;
+
+--
+-- Name: skew_analysis; Type: TABLE; Schema: dba_work; Owner: gpadmin; Tablespace: 
+--
+
+CREATE TABLE skew_analysis (
+    tablename text,
+    segment_id integer,
+    hostname text,
+    datadir text,
+    row_count double precision
+) DISTRIBUTED RANDOMLY;
+
+
+ALTER TABLE dba_work.skew_analysis OWNER TO gpadmin;
+
+--
+-- Name: skew_results; Type: TABLE; Schema: dba_work; Owner: gpadmin; Tablespace: 
+--
+
+CREATE TABLE skew_results (
+    tablename text,
+    segment_id integer,
+    datadir text,
+    total double precision,
+    row_count double precision,
+    variance integer
+) DISTRIBUTED RANDOMLY;
+
+
+ALTER TABLE dba_work.skew_results OWNER TO gpadmin;
+
+--
+-- Name: table_count; Type: TABLE; Schema: dba_work; Owner: gpadmin; Tablespace: 
+--
+
+CREATE TABLE table_count (
+    tablename character varying(200),
+    row_size bigint
+) DISTRIBUTED BY (tablename);
+
+
+ALTER TABLE dba_work.table_count OWNER TO gpadmin;
+
+--
+-- Name: table_count2; Type: TABLE; Schema: dba_work; Owner: gpadmin; Tablespace: 
+--
+
+CREATE TABLE table_count2 (
+    tablename character varying(200),
+    row_size bigint
+) DISTRIBUTED BY (tablename);
+
+
+ALTER TABLE dba_work.table_count2 OWNER TO gpadmin;
+
+--
+-- Name: table_inventory; Type: VIEW; Schema: dba_work; Owner: gpadmin
+--
+
+CREATE VIEW table_inventory AS
+    SELECT n.nspname AS schema, c.relname AS name, CASE c.relkind WHEN 'r'::"char" THEN 'table'::text WHEN 'v'::"char" THEN 'view'::text WHEN 'i'::"char" THEN 'index'::text ELSE NULL::text END AS type, CASE c.relhassubclass WHEN true THEN 'y'::text ELSE ' '::text END AS "part?", CASE c.relstorage WHEN 'c'::"char" THEN 'y'::text ELSE ' '::text END AS "col?", CASE c.relstorage WHEN 'c'::"char" THEN 'y'::text WHEN 'a'::"char" THEN 'y'::text ELSE ' '::text END AS "ao?", CASE WHEN (array_to_string(c.reloptions, ','::text) ~~ '%compresstype=%'::text) THEN 'y'::text ELSE ' '::text END AS "comp?", CASE c.relhasindex WHEN true THEN 'y'::text ELSE ' '::text END AS "idx?", r.rolname AS owner, c.relfilenode AS file_oid, c.relnatts AS cols, to_char((c.reltuples)::bigint, 'FM999,999,999,999'::text) AS "rows", to_char((c.relpages)::bigint, 'FM999,999,999,999'::text) AS pages FROM ((pg_class c JOIN pg_roles r ON ((r.oid = c.relowner))) LEFT JOIN pg_namespace n ON ((n.oid = c.relnamespace))) WHERE ((((((((n.nspname <> 'pg_catalog'::name) AND (n.nspname <> 'gp_toolkit'::name)) AND (n.nspname !~ '^pg_toast'::text)) AND ((n.nspname)::text <> 'information_schema'::text)) AND (c.relname !~~ 'pg_%'::text)) AND (c.relname !~~ '%_prt_%'::text)) AND (c.relname !~~ 'gp_%'::text)) AND (c.relkind = ANY (ARRAY['r'::"char", 'v'::"char", 'i'::"char", ''::"char"]))) ORDER BY n.nspname, c.relname, CASE c.relkind WHEN 'r'::"char" THEN '1 - table'::text WHEN 'i'::"char" THEN '2 - index'::text WHEN 'v'::"char" THEN '3 - view'::text ELSE '4 - none of the above'::text END;
+
+
+ALTER TABLE dba_work.table_inventory OWNER TO gpadmin;
+
+--
+-- Name: table_stats; Type: VIEW; Schema: dba_work; Owner: gpadmin
+--
+
+CREATE VIEW table_stats AS
+    SELECT sml.schemaname AS schema, sml.tablename AS "table", to_char((sml.reltuples)::bigint, 'FM999,999,999'::text) AS "rows", to_char((sml.relpages)::bigint, 'FM999,999,999'::text) AS pgs, to_char((sml.totta)::bigint, 'FM999,999,999'::text) AS exp_pgs, round(CASE WHEN (sml.totta = (0)::double precision) THEN 0.0 ELSE ((sml.relpages)::numeric / (sml.totta)::numeric) END, 1) AS ratio, CASE WHEN ((sml.relpages)::double precision < sml.totta) THEN ((0)::bpchar)::text ELSE to_char((((sml.relpages)::bigint)::double precision - sml.totta), 'FM999,999,999'::text) END AS pg_variance, CASE WHEN ((sml.relpages)::double precision < sml.totta) THEN ((0)::bpchar)::text ELSE to_char((sml.bs * ((((sml.relpages)::double precision - sml.totta))::bigint)::numeric), 'FM999,999,999'::text) END AS byte_variance FROM (SELECT rs.schemaname, rs.tablename, cc.reltuples, cc.relpages, rs.bs, ceil(((cc.reltuples * (((((rs.datahdr + (rs.ma)::numeric) - CASE WHEN ((rs.datahdr % (rs.ma)::numeric) = (0)::numeric) THEN (rs.ma)::numeric ELSE (rs.datahdr % (rs.ma)::numeric) END))::double precision + rs.nullhdr2) + (4)::double precision)) / ((rs.bs)::double precision - (20)::double precision))) AS totta, COALESCE(c2.relname, '?'::name) AS iname, COALESCE(c2.reltuples, (0)::real) AS ituples, COALESCE(c2.relpages, 0) AS ipages, COALESCE(ceil(((c2.reltuples * ((rs.datahdr - (12)::numeric))::double precision) / ((rs.bs)::double precision - (20)::double precision))), (0)::double precision) AS iotta FROM (((((SELECT foo.ma, foo.bs, foo.schemaname, foo.tablename, ((foo.datawidth + (((foo.hdr + foo.ma) - CASE WHEN ((foo.hdr % foo.ma) = 0) THEN foo.ma ELSE (foo.hdr % foo.ma) END))::double precision))::numeric AS datahdr, (foo.maxfracsum * (((foo.nullhdr + foo.ma) - CASE WHEN ((foo.nullhdr % (foo.ma)::bigint) = 0) THEN (foo.ma)::bigint ELSE (foo.nullhdr % (foo.ma)::bigint) END))::double precision) AS nullhdr2 FROM (SELECT st.schemaname, st.tablename, CASE WHEN ("substring"(version(), 12, 3) = '8.2'::text) THEN 27 ELSE 23 END AS hdr, CASE WHEN (version() ~ 'mingw32'::text) THEN 8 ELSE 4 END AS ma, (current_setting('block_size'::text))::numeric AS bs, st.datawidth, st.maxfracsum, (CASE WHEN ("substring"(version(), 12, 3) = '8.2'::text) THEN 27 ELSE 23 END + COALESCE(tmp.cnt, (1)::bigint)) AS nullhdr FROM ((SELECT s.schemaname, s.tablename, sum((((1)::double precision - s.null_frac) * (s.avg_width)::double precision)) AS datawidth, max(s.null_frac) AS maxfracsum FROM pg_stats s GROUP BY s.schemaname, s.tablename) st LEFT JOIN (SELECT s2.schemaname, s2.tablename, (1 + (count(*) / 8)) AS cnt FROM pg_stats s2 WHERE (s2.null_frac <> (0)::double precision) GROUP BY s2.schemaname, s2.tablename) tmp ON (((st.schemaname = tmp.schemaname) AND (st.tablename = tmp.tablename))))) foo) rs JOIN pg_class cc ON ((cc.relname = rs.tablename))) JOIN pg_namespace nn ON (((((cc.relnamespace = nn.oid) AND (nn.nspname = rs.schemaname)) AND (nn.nspname <> 'information_schema'::name)) AND (nn.nspname <> 'pg_catalog'::name)))) LEFT JOIN pg_index i ON ((i.indrelid = cc.oid))) LEFT JOIN pg_class c2 ON ((c2.oid = i.indexrelid)))) sml WHERE ((((sml.relpages)::double precision - sml.totta) > (2)::double precision) OR (((sml.ipages)::double precision - sml.iotta) > (2)::double precision)) ORDER BY sml.schemaname, sml.tablename, round(CASE WHEN (sml.totta = (0)::double precision) THEN 0.0 ELSE ((sml.relpages)::numeric / (sml.totta)::numeric) END, 1) DESC;
+
+
+ALTER TABLE dba_work.table_stats OWNER TO gpadmin;
+
+--
+-- Name: view_df; Type: VIEW; Schema: dba_work; Owner: gpadmin
+--
+
+CREATE VIEW view_df AS
+    SELECT DISTINCT df_ext.hostname, df_ext.size AS total, df_ext.used, df_ext.avail FROM ONLY df_ext ORDER BY df_ext.hostname, df_ext.size, df_ext.used, df_ext.avail;
+
+
+ALTER TABLE dba_work.view_df OWNER TO gpadmin;
+
+--
+-- Name: xid_lox; Type: VIEW; Schema: dba_work; Owner: gpadmin
+--
+
+CREATE VIEW xid_lox AS
+    SELECT (((n.nspname)::text || '.'::text) || (c.relname)::text) AS object_locked, s.usename AS role, l.pid AS lpid, l.transactionid AS lxid, c.relfrozenxid AS cfxid, x.state AS dxstate, l.page AS lpage, l.tuple AS lrow, l.mppiswriter AS "writer?", l.locktype AS ltype, l.mode AS lmode, l.granted, s.waiting, (now() - s.query_start) AS stmt_run_time, (s.current_query)::character varying(255) AS stmt_begins FROM (((((pg_locks l JOIN pg_class c ON ((c.oid = l.relation))) JOIN pg_database d ON ((d.oid = l.database))) JOIN pg_stat_activity s ON ((s.procpid = l.pid))) JOIN pg_namespace n ON (((n.oid = c.relnamespace) AND (n.nspname !~ '^pg_'::text)))) LEFT JOIN gp_distributed_xacts x ON ((x.distributed_xid = l.transactionid))) ORDER BY l.relation, d.datname, n.nspname, c.relname, l.pid;
+
+
+ALTER TABLE dba_work.xid_lox OWNER TO gpadmin;
+
+--
+-- Name: message_idx; Type: INDEX; Schema: dba_work; Owner: gpadmin; Tablespace: 
+--
+
+CREATE INDEX message_idx ON message_log USING btree (dt);
+
+
+--
+-- Greenplum Database database dump complete
+--
+
